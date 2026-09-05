@@ -1,0 +1,80 @@
+name: Issue 7129 Mac package repair
+
+on:
+  push:
+    branches: [fix/issue-7129-mac-packaging]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  package:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            sha256: 83c489592ebc7b0ae61082d1a223342973ee79377fd033d3b7bad4a338a34436
+          - os: macos-15-intel
+            sha256: b49f6110f9a16d69099925109a01608b2ca462b0196a07c8cc33361bf62535f0
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Fetch original verified build
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh run download 33938168058 --repo RemindZ/cc-switch --name issue-7129-${{ matrix.os }} --dir original
+          printf '%s  %s\n' '${{ matrix.sha256 }}' 'original/CC-Switch-Issue-7129-${{ matrix.os }}.zip' | shasum -a 256 -c -
+          mkdir -p verification
+          ditto -x -k 'original/CC-Switch-Issue-7129-${{ matrix.os }}.zip' extracted
+      - name: Reproduce missing bundle signature
+        run: |
+          app='extracted/CC Switch Issue 7129 Test.app'
+          if codesign --verify --deep --strict --verbose=4 "$app" > verification/before-signature.log 2>&1; then
+            echo 'Expected original bundle signature failure was not reproduced' >&2
+            exit 1
+          fi
+          cat verification/before-signature.log
+          codesign -dv --verbose=4 "$app" >> verification/before-signature.log 2>&1 || true
+      - name: Sign test bundle and verify archive round trip
+        run: |
+          set -o pipefail
+          app='extracted/CC Switch Issue 7129 Test.app'
+          codesign --force --sign - "$app"
+          codesign --verify --deep --strict --verbose=4 "$app" 2>&1 | tee verification/after-signature.log
+          codesign -dv --verbose=4 "$app" >> verification/after-signature.log 2>&1
+          ditto -c -k --sequesterRsrc --keepParent "$app" 'verification/CC-Switch-Issue-7129-${{ matrix.os }}.zip'
+          ditto -x -k 'verification/CC-Switch-Issue-7129-${{ matrix.os }}.zip' roundtrip
+          app='roundtrip/CC Switch Issue 7129 Test.app'
+          codesign --verify --deep --strict --verbose=4 "$app" 2>&1 | tee verification/roundtrip-signature.log
+          file "$app/Contents/MacOS/cc-switch" | tee verification/architecture.txt
+          # Ad-hoc signing seals the bundle; it does not establish Developer ID trust.
+          if spctl --assess --type execute --verbose=4 "$app" > verification/gatekeeper.log 2>&1; then
+            echo 'Gatekeeper accepted' >> verification/gatekeeper.log
+          else
+            echo 'Gatekeeper rejection expected for an unnotarized ad-hoc test app' >> verification/gatekeeper.log
+          fi
+          export CC_SWITCH_TEST_HOME="$RUNNER_TEMP/cc-switch-signing-test"
+          "$app/Contents/MacOS/cc-switch" > verification/startup.log 2>&1 &
+          app_pid=$!
+          trap 'kill "$app_pid" 2>/dev/null || true' EXIT
+          sleep 10
+          kill -0 "$app_pid"
+          grep -F '主窗口已显示' verification/startup.log
+          kill "$app_pid"
+          wait "$app_pid" || true
+          trap - EXIT
+          shasum -a 256 verification/*.zip > verification/SHA256.txt
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: issue-7129-signed-${{ matrix.os }}
+          path: verification/
+          if-no-files-found: error
+          retention-days: 30

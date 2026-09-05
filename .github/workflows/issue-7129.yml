@@ -57,10 +57,13 @@ jobs:
           sha256sum verification/*.exe | tee verification/SHA256.txt
       - name: Build macOS app
         if: runner.os == 'macOS'
+        env:
+          APPLE_SIGNING_IDENTITY: '-'
         run: |
           set -o pipefail
           pnpm tauri build --bundles app --config testing-build.json -- --locked 2>&1 | tee verification/build.log
           app='src-tauri/target/release/bundle/macos/CC Switch Issue 7129 Test.app'
+          codesign --verify --deep --strict --verbose=4 "$app" 2>&1 | tee verification/signature.log
           file "$app/Contents/MacOS/cc-switch" | tee verification/architecture.txt
           "$app/Contents/MacOS/cc-switch" > verification/startup.log 2>&1 &
           app_pid=$!
@@ -72,6 +75,8 @@ jobs:
           wait "$app_pid" || true
           trap - EXIT
           ditto -c -k --sequesterRsrc --keepParent "$app" verification/CC-Switch-Issue-7129-${{ matrix.os }}.zip
+          ditto -x -k verification/CC-Switch-Issue-7129-${{ matrix.os }}.zip "$RUNNER_TEMP/roundtrip"
+          codesign --verify --deep --strict --verbose=4 "$RUNNER_TEMP/roundtrip/CC Switch Issue 7129 Test.app"
           shasum -a 256 verification/*.zip | tee verification/SHA256.txt
       - name: Upload build and verification evidence
         if: always()
