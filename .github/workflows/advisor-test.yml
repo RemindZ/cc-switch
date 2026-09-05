@@ -52,7 +52,7 @@ jobs:
         if: runner.os == 'Windows'
         run: |
           set -o pipefail
-          pnpm tauri build --no-bundle --config testing-build.json -- --locked 2>&1 | tee verification/build.log
+          node node_modules/@tauri-apps/cli/tauri.js build --no-bundle --config testing-build.json -- --locked 2>&1 | tee verification/build.log
           cp src-tauri/target/release/cc-switch.exe verification/CC-Switch-Advisor-Test.exe
           sha256sum verification/*.exe | tee verification/SHA256.txt
       - name: Build macOS app
@@ -61,7 +61,7 @@ jobs:
           APPLE_SIGNING_IDENTITY: "-"
         run: |
           set -o pipefail
-          pnpm tauri build --bundles app --config testing-build.json -- --locked 2>&1 | tee verification/build.log
+          node node_modules/@tauri-apps/cli/tauri.js build --bundles app --config testing-build.json -- --locked 2>&1 | tee verification/build.log
           app='src-tauri/target/release/bundle/macos/CC Switch Advisor Test.app'
           codesign --verify --deep --strict --verbose=4 "$app" 2>&1 | tee verification/signature.log
           codesign -dv --verbose=4 "$app" 2>&1 | tee -a verification/signature.log
