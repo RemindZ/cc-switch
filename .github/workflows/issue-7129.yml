@@ -1,0 +1,83 @@
+name: Issue 7129 platform proof
+
+on:
+  push:
+    branches: [validate/issue-7129]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, macos-15, macos-15-intel]
+    defaults:
+      run:
+        shell: bash
+    env:
+      CC_SWITCH_TEST_HOME: ${{ runner.temp }}/cc-switch-7129-home
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+      - name: Prepare locked dependencies
+        run: |
+          corepack enable
+          corepack install
+          pnpm install --frozen-lockfile
+          rustup show
+          mkdir -p verification dist
+          git rev-parse HEAD | tee verification/revision.txt
+          printf '%s\n' '{"productName":"CC Switch Issue 7129 Test","identifier":"com.ccswitch.issue7129test","bundle":{"createUpdaterArtifacts":false}}' > testing-build.json
+      - name: Frontend checks
+        run: |
+          set -o pipefail
+          pnpm typecheck 2>&1 | tee verification/typecheck.log
+          pnpm test:unit tests/components/ClaudeFormFields.test.tsx tests/components/ProviderForm.codexManagedAccount.test.tsx 2>&1 | tee verification/frontend-tests.log
+      - name: Rust regression and adapter tests
+        run: |
+          set -o pipefail
+          rustfmt --check --edition 2021 src-tauri/src/proxy/providers/claude.rs src-tauri/src/proxy/providers/codex_oauth_auth.rs src-tauri/src/services/codex_oauth_models.rs
+          cargo test --locked --lib --manifest-path src-tauri/Cargo.toml -- proxy::providers::claude::tests services::codex_oauth_models::tests 2>&1 | tee verification/rust-tests.log
+      - name: Build Windows EXE
+        if: runner.os == 'Windows'
+        run: |
+          set -o pipefail
+          pnpm tauri build --no-bundle --config testing-build.json -- --locked 2>&1 | tee verification/build.log
+          cp src-tauri/target/release/cc-switch.exe verification/CC-Switch-Issue-7129-Test.exe
+          sha256sum verification/*.exe | tee verification/SHA256.txt
+      - name: Build macOS app
+        if: runner.os == 'macOS'
+        run: |
+          set -o pipefail
+          pnpm tauri build --bundles app --config testing-build.json -- --locked 2>&1 | tee verification/build.log
+          app='src-tauri/target/release/bundle/macos/CC Switch Issue 7129 Test.app'
+          file "$app/Contents/MacOS/cc-switch" | tee verification/architecture.txt
+          "$app/Contents/MacOS/cc-switch" > verification/startup.log 2>&1 &
+          app_pid=$!
+          trap 'kill "$app_pid" 2>/dev/null || true' EXIT
+          sleep 10
+          kill -0 "$app_pid"
+          echo 'Native macOS app remained running for 10 seconds.' | tee verification/startup-result.txt
+          kill "$app_pid"
+          wait "$app_pid" || true
+          trap - EXIT
+          ditto -c -k --sequesterRsrc --keepParent "$app" verification/CC-Switch-Issue-7129-${{ matrix.os }}.zip
+          shasum -a 256 verification/*.zip | tee verification/SHA256.txt
+      - name: Upload build and verification evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: issue-7129-${{ matrix.os }}
+          path: verification/
+          if-no-files-found: error
+          retention-days: 30
