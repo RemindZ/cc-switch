@@ -545,6 +545,220 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn artifact_fallback_http_works_without_advisor_in_json_and_streams() {
+        use axum::response::IntoResponse;
+        let captured = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let mock_app = Router::new().route("/v1/responses", post({
+            let captured = captured.clone();
+            move |axum::Json(body): axum::Json<Value>| {
+                let captured = captured.clone();
+                async move {
+                    let mut requests = captured.lock().await;
+                    let first = requests.len() % 2 == 0;
+                    let streaming = body["stream"] == true;
+                    requests.push(body);
+                    let item = if first {
+                        json!({"id":"fc_artifact","type":"function_call","call_id":"artifact_1","name":"Artifact",
+                            "arguments":"{\"file_path\":\"/Users/test/plan.html\"}","status":"completed"})
+                    } else {
+                        json!({"id":"msg_test","type":"message","role":"assistant","status":"completed",
+                            "content":[{"type":"output_text","text":"LOCAL_PREVIEW_NEXT","annotations":[]}]})
+                    };
+                    let response = json!({"id":"resp_test","object":"response","model":"working-model","status":"completed",
+                        "output":[item.clone()],"usage":{"input_tokens":10,"output_tokens":5,"total_tokens":15}});
+                    if !streaming {
+                        return axum::Json(response).into_response();
+                    }
+                    let mut events = vec![
+                        json!({"type":"response.created","response":{"id":"resp_test","model":"working-model","status":"in_progress","output":[]}}),
+                        json!({"type":"response.output_item.added","output_index":0,"item":item})
+                    ];
+                    if !first {
+                        events.push(json!({"type":"response.output_text.delta","output_index":0,"content_index":0,"item_id":"msg_test","delta":"LOCAL_PREVIEW_NEXT"}));
+                    }
+                    events.push(json!({"type":"response.output_item.done","output_index":0,"item":item}));
+                    events.push(json!({"type":"response.completed","response":response}));
+                    let wire: String = events.iter().map(|event| format!("event: {}\ndata: {}\n\n", event["type"].as_str().unwrap(), event)).collect();
+                    ([("content-type","text/event-stream")], wire).into_response()
+                }
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let mock_handle =
+            tokio::spawn(async move { axum::serve(listener, mock_app).await.unwrap() });
+        let db = Arc::new(Database::memory().unwrap());
+        let mut provider = Provider::with_id(
+            "artifact-test".into(),
+            "Artifact test".into(),
+            json!({"env":{"ANTHROPIC_BASE_URL":format!("http://{address}/v1"),"ANTHROPIC_AUTH_TOKEN":"synthetic-token"}}),
+            None,
+        );
+        provider.meta = Some(ProviderMeta {
+            api_format: Some("openai_responses".into()),
+            ..Default::default()
+        });
+        db.save_provider("claude", &provider).unwrap();
+        db.set_current_provider("claude", &provider.id).unwrap();
+        let server = ProxyServer::new(
+            ProxyConfig {
+                listen_port: 0,
+                ..Default::default()
+            },
+            db,
+            None,
+        );
+        let info = server.start().await.unwrap();
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        for streaming in [false, true] {
+            let response = client.post(format!("http://127.0.0.1:{}/v1/messages", info.port))
+                .json(&json!({"model":"working-model","stream":streaming,"max_tokens":4096,
+                    "messages":[{"role":"user","content":"Show my plan"}],
+                    "tools":[{"name":"Artifact","input_schema":{"type":"object","properties":{}}}]}))
+                .send().await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let wire = response.text().await.unwrap();
+            let message = if streaming {
+                crate::proxy::providers::transform_codex_anthropic::anthropic_sse_to_message_value(
+                    &wire,
+                )
+                .unwrap()
+            } else {
+                serde_json::from_str::<Value>(&wire).unwrap()
+            };
+            assert!(
+                message["content"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|block| block["type"] == "text"),
+                "Artifact escaped to Claude Code: {message}"
+            );
+            assert!(message.to_string().contains("LOCAL_PREVIEW_NEXT"));
+        }
+        let requests = captured.lock().await;
+        assert_eq!(requests.len(), 4);
+        for request in [&requests[1], &requests[3]] {
+            let feedback = request["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|item| {
+                    item["type"] == "function_call_output" && item["call_id"] == "artifact_1"
+                })
+                .expect("Artifact must receive a matching tool result");
+            assert_eq!(
+                feedback["output"][0]["text"],
+                crate::proxy::providers::transform_responses::TOOL_RESULT_ERROR_MARKER
+            );
+            assert!(feedback["output"][1]["text"]
+                .as_str()
+                .unwrap()
+                .contains("localhost"));
+        }
+        server.stop().await.unwrap();
+        mock_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn advisor_compaction_preserves_upstream_errors_in_json_and_streams() {
+        let mock_app = Router::new().route(
+            "/v1/responses",
+            post(|axum::Json(body): axum::Json<Value>| async move {
+                let (status, kind, message) = if body["model"] == "rate-limit" {
+                    (
+                        StatusCode::TOO_MANY_REQUESTS,
+                        "rate_limit_error",
+                        "Rate limit reached",
+                    )
+                } else {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        "invalid_request_error",
+                        "prompt is too long",
+                    )
+                };
+                (
+                    status,
+                    axum::Json(json!({"error":{"type":kind,"message":message}})),
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let mock_handle =
+            tokio::spawn(async move { axum::serve(listener, mock_app).await.unwrap() });
+        let db = Arc::new(Database::memory().unwrap());
+        let mut provider = Provider::with_id(
+            "advisor-errors".into(),
+            "Advisor errors".into(),
+            json!({"env":{"ANTHROPIC_BASE_URL":format!("http://{address}/v1"),
+                "ANTHROPIC_AUTH_TOKEN":"synthetic-secret","CC_SWITCH_ADVISOR_MODEL":"gpt-6-astra"}}),
+            None,
+        );
+        provider.meta = Some(ProviderMeta {
+            api_format: Some("openai_responses".into()),
+            ..Default::default()
+        });
+        db.save_provider("claude", &provider).unwrap();
+        db.set_current_provider("claude", &provider.id).unwrap();
+        let server = ProxyServer::new(
+            ProxyConfig {
+                listen_port: 0,
+                ..Default::default()
+            },
+            db,
+            None,
+        );
+        let info = server.start().await.unwrap();
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        for (model, status, kind, message) in [
+            (
+                "context-limit",
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "prompt is too long",
+            ),
+            (
+                "rate-limit",
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate_limit_error",
+                "Rate limit reached",
+            ),
+        ] {
+            for streaming in [false, true] {
+                let response = client.post(format!("http://127.0.0.1:{}/v1/messages", info.port))
+                    .json(&json!({"model":model,"stream":streaming,"max_tokens":4096,
+                        "messages":[{"role":"user","content":"Summarize the conversation"}],"tools":[]}))
+                    .send().await.unwrap();
+                assert_eq!(
+                    response.status(),
+                    if streaming { StatusCode::OK } else { status }
+                );
+                let text = response.text().await.unwrap();
+                let error: Value = if streaming {
+                    serde_json::from_str(
+                        text.lines()
+                            .find_map(|line| line.strip_prefix("data: "))
+                            .unwrap(),
+                    )
+                    .unwrap()
+                } else {
+                    serde_json::from_str(&text).unwrap()
+                };
+                assert_eq!(error["error"]["type"], kind);
+                assert_eq!(error["error"]["message"], message);
+            }
+        }
+        server.stop().await.unwrap();
+        mock_handle.abort();
+    }
+
+    #[tokio::test]
     async fn native_advisor_is_passed_through_without_local_execution() {
         let captured = Arc::new(Mutex::new(Vec::<Value>::new()));
         let mock_app = Router::new().route("/v1/messages", post({
@@ -585,10 +799,12 @@ mod tests {
         );
         let info = server.start().await.unwrap();
         let native_tool = json!({"type":"advisor_20260301","name":"advisor","model":"claude-opus-5","max_uses":1});
+        let artifact_tool =
+            json!({"name":"Artifact","input_schema":{"type":"object","properties":{}}});
         let response = reqwest::Client::builder().no_proxy().build().unwrap()
             .post(format!("http://127.0.0.1:{}/v1/messages", info.port))
             .json(&json!({"model":"claude-sonnet-4-6","max_tokens":100,"stream":false,
-                "messages":[{"role":"user","content":"Review this"}],"tools":[native_tool.clone()]}))
+                "messages":[{"role":"user","content":"Review this"}],"tools":[native_tool.clone(),artifact_tool.clone()]}))
             .send().await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let response: Value = response.json().await.unwrap();
@@ -598,7 +814,7 @@ mod tests {
         );
         let requests = captured.lock().await;
         assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0]["tools"], json!([native_tool]));
+        assert_eq!(requests[0]["tools"], json!([native_tool, artifact_tool]));
         server.stop().await.unwrap();
         mock_handle.abort();
     }

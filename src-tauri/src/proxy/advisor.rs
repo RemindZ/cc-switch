@@ -1,4 +1,4 @@
-//! Same-provider execution of Claude's advisor server tool.
+//! Same-provider advisor execution and local fallback for unsupported Artifact hosting.
 use super::model_mapper::strip_one_m_suffix_for_upstream;
 use super::ProxyError;
 use futures::Stream;
@@ -9,6 +9,7 @@ pub(crate) const MODEL_ENV: &str = "CC_SWITCH_ADVISOR_MODEL";
 const MAX_USES: u64 = 2;
 const MAX_CONTEXT_BYTES: usize = 2 * 1024 * 1024;
 const MAX_ONE_M_CONTEXT_BYTES: usize = 8 * 1024 * 1024;
+const ARTIFACT_FALLBACK: &str = "CC Switch: Artifact publishing to claude.ai is unavailable for this provider. HTML creation and editing still work. Nothing was published and no local server was started. Do not retry Artifact or change authentication settings. Use existing file/shell tools on the Claude Code client machine to serve only the artifact directory on 127.0.0.1 (localhost); verify the server responds before opening or returning its URL. Report execution failures instead of claiming success.";
 
 pub(crate) fn consultation_provider(
     provider: &crate::provider::Provider,
@@ -46,10 +47,14 @@ pub(crate) fn configured_model(provider: &crate::provider::Provider) -> Option<S
         .map(str::to_owned)
 }
 
-pub(crate) fn has_advisor(body: &Value) -> bool {
+pub(crate) fn has_local_tools(body: &Value) -> bool {
     body.get("tools")
         .and_then(Value::as_array)
-        .is_some_and(|tools| tools.iter().any(is_advisor))
+        .is_some_and(|tools| {
+            tools
+                .iter()
+                .any(|tool| is_advisor(tool) || tool["name"] == "Artifact")
+        })
         || body
             .get("messages")
             .and_then(Value::as_array)
@@ -104,11 +109,20 @@ fn normalize_history(body: &mut Value) {
     }
 }
 
-fn block_events(block: Value, index: usize) -> Vec<Value> {
+fn block_events(mut block: Value, index: usize) -> Vec<Value> {
     if block["type"] == "text" {
         vec![
             json!({"type":"content_block_start","index":index,"content_block":{"type":"text","text":""}}),
             json!({"type":"content_block_delta","index":index,"delta":{"type":"text_delta","text":block["text"]}}),
+            json!({"type":"content_block_stop","index":index}),
+        ]
+    } else if block["type"] == "tool_use" {
+        // Claude Code reads tool arguments from deltas, not the opening block.
+        let input = block.get("input").cloned().unwrap_or(json!({}));
+        block["input"] = json!({});
+        vec![
+            json!({"type":"content_block_start","index":index,"content_block":block}),
+            json!({"type":"content_block_delta","index":index,"delta":{"type":"input_json_delta","partial_json":input.to_string()}}),
             json!({"type":"content_block_stop","index":index}),
         ]
     } else {
@@ -197,8 +211,9 @@ where
         // The transport caps each response; incremental forwarding can reduce first-text latency later.
         for round in 0..(MAX_USES + 2) {
             body["max_tokens"] = json!(output_budget.saturating_sub(usage["output_tokens"].as_u64().unwrap_or(0)).max(1));
-            let response = tokio::time::timeout(std::time::Duration::from_secs(180), send(body.clone(), false)).await
-                .map_err(|_| ProxyError::Timeout("Executor request timed out".into()))??;
+            // Executor streams use the transport's timeout policy. A total deadline
+            // here kills healthy long reasoning and compaction requests.
+            let response = send(body.clone(), false).await?;
             if round == 0 {
                 yield json!({"type":"message_start","message":{"id":format!("msg_{}",uuid::Uuid::new_v4().simple()),"type":"message","role":"assistant","model":response.get("model").unwrap_or(&body["model"]),"content":[],"stop_reason":null,"usage":usage}});
             }
@@ -206,9 +221,22 @@ where
             let blocks = response.get("content").and_then(Value::as_array)
                 .ok_or_else(|| ProxyError::TransformError("Executor response has no content array".into()))?;
             let mut replay = Vec::new();
+            let mut local_results = Vec::new();
             let mut consulted = false;
             let mut client_tools = false;
             for block in blocks {
+                if block["type"] == "tool_use" && block["name"] == "Artifact" {
+                    // Hosting is a Claude account service, not a model capability.
+                    // Consume the call here; the proxy must not access the client's files.
+                    consulted = true;
+                    replay.push(block.clone());
+                    local_results.push(json!({"type":"tool_result","tool_use_id":block["id"],"is_error":true,"content":ARTIFACT_FALLBACK}));
+                    // Also preserve the feedback in client history when other tools
+                    // in this round must execute before the model can continue.
+                    for event in block_events(json!({"type":"text","text":ARTIFACT_FALLBACK}), index) { yield event; }
+                    index += 1;
+                    continue;
+                }
                 if block["type"] != "tool_use" || !is_advisor(block) {
                     client_tools |= block["type"] == "tool_use";
                     replay.push(block.clone());
@@ -269,13 +297,18 @@ where
                 break;
             }
             if round == MAX_USES + 1 {
-                Err(ProxyError::TransformError("Executor continued requesting advisor after the consultation limit".into()))?;
+                Err(ProxyError::TransformError("Executor continued requesting local tools after the exchange limit".into()))?;
             }
             replay_content(&mut replay);
             let messages = body.get_mut("messages").and_then(Value::as_array_mut)
                 .ok_or_else(|| ProxyError::InvalidRequest("Missing messages array".into()))?;
             messages.push(json!({"role":"assistant","content":replay}));
-            messages.push(json!({"role":"user","content":"Continue the original task using the advisor's guidance where appropriate."}));
+            if local_results.is_empty() {
+                messages.push(json!({"role":"user","content":"Continue the original task using the advisor's guidance where appropriate."}));
+            } else {
+                messages.push(json!({"role":"user","content":local_results}));
+                body["tools"].as_array_mut().unwrap().retain(|tool| tool["name"] != "Artifact");
+            }
             body["tool_choice"] = json!({"type":"auto"});
             if uses >= max_uses {
                 body["tools"].as_array_mut().unwrap().retain(|tool| !is_advisor(tool));
@@ -447,6 +480,141 @@ mod tests {
         .await;
         assert!(events.last().unwrap().is_err());
         assert_eq!(*calls.lock().unwrap(), (4, 2));
+    }
+
+    #[tokio::test]
+    async fn advisor_stream_sends_client_tool_arguments_as_json_deltas() {
+        // Claude Code reconstructs tool input from deltas, ignoring start input.
+        for model in [Some("gpt-6-astra".into()), None] {
+            let events: Vec<_> = run(request(), model, |_, advisor| async move {
+                assert!(!advisor);
+                Ok(reply(json!([
+                    {"type":"tool_use","id":"call_read","name":"Read","input":{"file_path":"C:\\test\\quoted \"文\".txt"}},
+                    {"type":"tool_use","id":"call_mcp","name":"mcp__test","input":{"nested":{"items":[1,true,null]},"text":"first\nsecond"}},
+                    {"type":"tool_use","id":"call_empty","name":"Empty","input":{}}
+                ])))
+            }).collect().await;
+            let events: Vec<_> = events.into_iter().map(Result::unwrap).collect();
+            for (index, expected) in [
+                json!({"file_path":"C:\\test\\quoted \"文\".txt"}),
+                json!({"nested":{"items":[1,true,null]},"text":"first\nsecond"}),
+                json!({}),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let partial: String = events
+                    .iter()
+                    .filter(|event| {
+                        event["index"] == index && event["delta"]["type"] == "input_json_delta"
+                    })
+                    .map(|event| event["delta"]["partial_json"].as_str().unwrap())
+                    .collect();
+                assert!(
+                    !partial.is_empty(),
+                    "tool {index} lost its arguments: no JSON delta"
+                );
+                assert_eq!(serde_json::from_str::<Value>(&partial).unwrap(), expected);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn artifact_fallback_returns_localhost_guidance_and_preserves_other_tools() {
+        for advisor_model in [None, Some("gpt-6-astra".to_string())] {
+            for parallel_tool in [false, true] {
+                let calls = Arc::new(Mutex::new(Vec::new()));
+                let captured = calls.clone();
+                let mut body = request();
+                body["tools"] = json!([
+                    {"name":"Artifact","input_schema":{"type":"object","properties":{}}},
+                    {"name":"Bash","input_schema":{"type":"object","properties":{}}}
+                ]);
+                let result = collect(run(body, advisor_model.clone(), move |body, advisor| {
+                    assert!(!advisor, "Artifact must not spend an advisor request");
+                    let mut calls = captured.lock().unwrap();
+                    calls.push(body);
+                    let response = if calls.len() == 1 {
+                        let mut blocks = vec![
+                            json!({"type":"tool_use","id":"artifact_1","name":"Artifact",
+                            "input":{"file_path":"/Users/test/.claude/artifacts/plan.html"}}),
+                        ];
+                        if parallel_tool {
+                            blocks.push(json!({"type":"tool_use","id":"bash_1","name":"Bash",
+                                "input":{"command":"echo test"}}));
+                        }
+                        reply(json!(blocks))
+                    } else {
+                        assert_eq!(calls.len(), 2, "fallback must not loop");
+                        reply(json!([{"type":"text","text":"I will preview the HTML locally."}]))
+                    };
+                    async move { Ok(response) }
+                }))
+                .await;
+                let calls = calls.lock().unwrap();
+                let content = result["content"].as_array().unwrap();
+                assert!(
+                    !content.iter().any(|block| block["name"] == "Artifact"),
+                    "native Artifact call escaped: {result}"
+                );
+                assert!(content.iter().any(|block| block["text"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("localhost"))));
+                if parallel_tool {
+                    assert_eq!(calls.len(), 1, "must await client tool results");
+                    assert_eq!(result["stop_reason"], "tool_use");
+                    assert!(content
+                        .iter()
+                        .any(|block| block["id"] == "bash_1"
+                            && block["input"]["command"] == "echo test"));
+                } else {
+                    assert_eq!(calls.len(), 2);
+                    assert!(!calls[1]["tools"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|tool| tool["name"] == "Artifact"));
+                    let history = calls[1]["messages"].as_array().unwrap();
+                    assert_eq!(history[history.len() - 2]["content"][0]["id"], "artifact_1");
+                    let feedback = &history.last().unwrap()["content"][0];
+                    assert_eq!(feedback["type"], "tool_result");
+                    assert_eq!(feedback["tool_use_id"], "artifact_1");
+                    assert_eq!(feedback["is_error"], true);
+                    let text = feedback["content"].as_str().unwrap();
+                    for expected in [
+                        "claude.ai",
+                        "HTML",
+                        "localhost",
+                        "127.0.0.1",
+                        "client machine",
+                        "verify",
+                        "authentication",
+                    ] {
+                        assert!(text.contains(expected), "missing {expected}: {text}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn advisor_allows_executor_compaction_longer_than_three_minutes() {
+        let mut body = request();
+        body["tools"] = json!([]);
+        body["stream"] = json!(false);
+        let result = collect(run(
+            body,
+            Some("gpt-6-astra".into()),
+            |_, advisor| async move {
+                assert!(!advisor);
+                tokio::time::sleep(std::time::Duration::from_secs(181)).await;
+                Ok(reply(
+                    json!([{"type":"text","text":"Compaction completed"}]),
+                ))
+            },
+        ))
+        .await;
+        assert_eq!(result["content"][0]["text"], "Compaction completed");
     }
 
     #[tokio::test]

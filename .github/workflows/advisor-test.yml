@@ -47,7 +47,7 @@ jobs:
         run: |
           set -o pipefail
           cargo fmt --check --manifest-path src-tauri/Cargo.toml
-          cargo test --locked -j 1 --lib --manifest-path src-tauri/Cargo.toml -- advisor proxy::providers::claude::tests services::codex_oauth_models::tests 2>&1 | tee verification/rust-tests.log
+          cargo test --locked -j 1 --lib --manifest-path src-tauri/Cargo.toml -- advisor artifact_fallback proxy::providers::transform::tests proxy::providers::transform_responses::tests proxy::providers::claude::tests services::codex_oauth_models::tests 2>&1 | tee verification/rust-tests.log
       - name: Build Windows EXE
         if: runner.os == 'Windows'
         run: |

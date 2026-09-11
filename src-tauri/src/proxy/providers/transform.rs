@@ -487,15 +487,70 @@ fn clean_schema_inner(mut schema: Value, is_root: bool) -> Value {
             obj.remove("format");
         }
 
-        // 递归清理嵌套 schema
-        if let Some(properties) = obj.get_mut("properties").and_then(|v| v.as_object_mut()) {
-            for (_, value) in properties.iter_mut() {
-                *value = clean_schema_inner(value.clone(), false);
-            }
+        // Some OpenAI-compatible validators reject JavaScript Unicode property
+        // escapes (e.g. Claude Code's Artifact name pattern). Keep the constraint
+        // as model guidance; the caller's original tool schema is unchanged.
+        let unicode_pattern = obj
+            .get("pattern")
+            .and_then(Value::as_str)
+            .is_some_and(|pattern| {
+                let mut chars = pattern.chars();
+                while let Some(ch) = chars.next() {
+                    if ch == '\\'
+                        && matches!(chars.next(), Some('p' | 'P'))
+                        && chars.clone().next() == Some('{')
+                    {
+                        return true;
+                    }
+                }
+                false
+            });
+        if unicode_pattern {
+            let pattern = obj.remove("pattern").unwrap();
+            let description = obj.get("description").and_then(Value::as_str).unwrap_or("");
+            let guidance = format!(
+                "Must match this Unicode regular expression: {}",
+                pattern.as_str().unwrap()
+            );
+            let description = if description.is_empty() {
+                guidance
+            } else {
+                format!("{description}\n{guidance}")
+            };
+            obj.insert("description".to_string(), json!(description));
         }
 
-        if let Some(items) = obj.get_mut("items") {
-            *items = clean_schema_inner(items.clone(), false);
+        // Recurse through schema keywords, never through examples/default/enum data.
+        for (key, value) in obj.iter_mut() {
+            match key.as_str() {
+                "properties" | "patternProperties" | "$defs" | "definitions"
+                | "dependentSchemas" | "dependencies" => {
+                    if let Some(schemas) = value.as_object_mut() {
+                        for child in schemas.values_mut() {
+                            *child = clean_schema_inner(child.take(), false);
+                        }
+                    }
+                }
+                "allOf" | "anyOf" | "oneOf" | "prefixItems" | "items" if value.is_array() => {
+                    for child in value.as_array_mut().unwrap() {
+                        *child = clean_schema_inner(child.take(), false);
+                    }
+                }
+                "items"
+                | "additionalProperties"
+                | "additionalItems"
+                | "contains"
+                | "not"
+                | "if"
+                | "then"
+                | "else"
+                | "propertyNames"
+                | "unevaluatedProperties"
+                | "unevaluatedItems" => {
+                    *value = clean_schema_inner(value.take(), false);
+                }
+                _ => {}
+            }
         }
     }
     schema
@@ -870,6 +925,89 @@ mod tests {
         let result = anthropic_to_openai(input).unwrap();
         let parameters = &result["tools"][0]["function"]["parameters"];
         assert_eq!(parameters, &json!({"type": "object", "properties": {}}));
+    }
+
+    #[test]
+    fn test_artifact_unicode_pattern_is_normalized_for_both_openai_adapters() {
+        let pattern = r#"^(?!__.*__$)[^\p{Cc}\p{Cf}\p{Zl}\p{Zp}"\\./[\]]{1,200}$"#;
+        let input = json!({
+            "model": "gpt-4o", "max_tokens": 1024,
+            "messages": [{"role": "user", "content": "Create an artifact"}],
+            "tools": [{"name": "Artifact", "input_schema": {
+                "type": "object", "properties": {"name": {
+                    "type": "string", "description": "Artifact name.",
+                    "pattern": pattern, "minLength": 1, "maxLength": 200
+                }}, "required": ["name"]
+            }}]
+        });
+        let chat = anthropic_to_openai(input.clone()).unwrap();
+        let responses = super::super::transform_responses::anthropic_to_responses(
+            input.clone(),
+            None,
+            false,
+            false,
+        )
+        .unwrap();
+        for schema in [
+            &chat["tools"][0]["function"]["parameters"],
+            &responses["tools"][0]["parameters"],
+        ] {
+            let name = &schema["properties"]["name"];
+            assert!(
+                name.get("pattern").is_none(),
+                "unsupported regex reached upstream: {name}"
+            );
+            assert_eq!(name["type"], "string");
+            assert_eq!(name["minLength"], 1);
+            assert_eq!(name["maxLength"], 200);
+            assert_eq!(schema["required"], json!(["name"]));
+            let description = name["description"].as_str().unwrap();
+            assert!(description.starts_with("Artifact name."));
+            assert!(description.contains(pattern));
+        }
+        assert_eq!(
+            input["tools"][0]["input_schema"]["properties"]["name"]["pattern"],
+            pattern
+        );
+    }
+
+    #[test]
+    fn test_clean_schema_unicode_patterns_only_in_schema_nodes() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "normal": {"pattern": "^(?!__)[a-z]{1,200}$"},
+                "literal": {"pattern": r"\\p{Cc}"},
+                "choice": {"anyOf": [{"pattern": r"\P{Cc}+"}, {"type": "null"}]},
+                "list": {"items": {"allOf": [{"pattern": r"\p{L}+"}]}}
+            },
+            "$defs": {"name": {"pattern": r"\p{L}+"}},
+            "additionalProperties": {"pattern": r"\p{L}+"},
+            "examples": [{"pattern": r"\p{Cc}"}],
+            "default": {"pattern": r"\p{Cc}"},
+            "enum": [{"pattern": r"\p{Cc}"}]
+        });
+        let cleaned = clean_schema(schema.clone());
+        for key in ["normal", "literal"] {
+            assert_eq!(cleaned["properties"][key], schema["properties"][key]);
+        }
+        for path in [
+            "/properties/choice/anyOf/0",
+            "/properties/list/items/allOf/0",
+            "/$defs/name",
+            "/additionalProperties",
+        ] {
+            let node = cleaned.pointer(path).unwrap();
+            assert!(node.get("pattern").is_none(), "{path}: {node}");
+            assert!(node["description"]
+                .as_str()
+                .unwrap()
+                .contains("regular expression"));
+        }
+        for key in ["examples", "default", "enum"] {
+            assert_eq!(cleaned[key], schema[key]);
+        }
+        assert_eq!(clean_schema(cleaned.clone()), cleaned);
     }
 
     #[test]
