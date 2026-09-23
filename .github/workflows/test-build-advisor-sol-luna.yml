@@ -34,7 +34,7 @@ jobs:
         run: |
           set -euo pipefail
           test "$(uname -m)" = arm64
-          pnpm tauri build --bundles app --config testing-build.json -- --locked
+          node node_modules/@tauri-apps/cli/tauri.js build --bundles app --config testing-build.json -- --locked
           app='src-tauri/target/release/bundle/macos/CC Switch Advisor Sol Luna Test.app'
           test -d "$app"
           codesign --verify --deep --strict --verbose=4 "$app" 2>&1 | tee verification/app-signature.txt
