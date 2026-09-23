@@ -1,0 +1,77 @@
+name: Advisor Sol Luna test DMG
+
+on:
+  push:
+    branches: [test/advisor-sol-luna-review-fixes]
+
+permissions:
+  contents: read
+
+jobs:
+  mac-dmg:
+    runs-on: macos-15
+    timeout-minutes: 75
+    env:
+      APPLE_SIGNING_IDENTITY: "-"
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+      CC_SWITCH_TEST_HOME: /tmp/cc-switch-test-home
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+      - name: Install dependencies
+        run: |
+          corepack enable
+          corepack install
+          pnpm install --frozen-lockfile
+          rustup show
+          mkdir -p verification
+          git rev-parse HEAD > verification/revision.txt
+          printf '%s\n' '{"productName":"CC Switch Advisor Sol Luna Test","bundle":{"createUpdaterArtifacts":false}}' > testing-build.json
+      - name: Build Apple Silicon app
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = arm64
+          pnpm tauri build --bundles app --config testing-build.json -- --locked
+          app='src-tauri/target/release/bundle/macos/CC Switch Advisor Sol Luna Test.app'
+          test -d "$app"
+          codesign --verify --deep --strict --verbose=4 "$app" 2>&1 | tee verification/app-signature.txt
+          file "$app/Contents/MacOS/cc-switch" | tee verification/architecture.txt
+          file "$app/Contents/MacOS/cc-switch" | grep -F arm64
+          "$app/Contents/MacOS/cc-switch" > verification/startup.log 2>&1 &
+          app_pid=$!
+          sleep 8
+          kill -0 "$app_pid"
+          kill "$app_pid"
+          wait "$app_pid" || true
+      - name: Package and verify DMG
+        run: |
+          set -euo pipefail
+          app='src-tauri/target/release/bundle/macos/CC Switch Advisor Sol Luna Test.app'
+          stage="$RUNNER_TEMP/dmg-stage"
+          mkdir -p "$stage" "$RUNNER_TEMP/dmg-mount"
+          ditto "$app" "$stage/CC Switch Advisor Sol Luna Test.app"
+          ln -s /Applications "$stage/Applications"
+          printf '%s\n' \
+            'Drag the app to Applications.' \
+            'This is an ad-hoc signed test build, not Apple-notarized.' \
+            'If macOS blocks it after copying, run:' \
+            'xattr -dr com.apple.quarantine "/Applications/CC Switch Advisor Sol Luna Test.app"' \
+            > "$stage/README.txt"
+          dmg='verification/CC-Switch-Advisor-Sol-Luna-Review-macOS-arm64.dmg'
+          hdiutil create -srcfolder "$stage" -volname 'CC Switch Advisor Sol Luna Test' -format UDZO -ov "$dmg"
+          hdiutil verify "$dmg"
+          hdiutil attach -readonly -nobrowse -mountpoint "$RUNNER_TEMP/dmg-mount" "$dmg"
+          codesign --verify --deep --strict --verbose=4 "$RUNNER_TEMP/dmg-mount/CC Switch Advisor Sol Luna Test.app" 2>&1 | tee verification/dmg-app-signature.txt
+          file "$RUNNER_TEMP/dmg-mount/CC Switch Advisor Sol Luna Test.app/Contents/MacOS/cc-switch" | tee verification/dmg-architecture.txt
+          hdiutil detach "$RUNNER_TEMP/dmg-mount"
+          shasum -a 256 "$dmg" | tee verification/SHA256.txt
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: advisor-sol-luna-macos-arm64
+          path: verification/
+          if-no-files-found: error
+          retention-days: 30
